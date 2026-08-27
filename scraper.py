@@ -10,7 +10,6 @@ import re
 import json
 import sys
 import requests
-from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # KONFIGŪRACIJA
@@ -422,15 +421,6 @@ def main():
         # atnaujinam seen sąrašą (laikom tik paskutinius ~500, kad failas neaugtų amžinai)
         updated = list(platform_seen.union(listings.keys()))
         seen[name] = updated[-500:]
-
-    # Visada atnaujinam laiko žymą - net jei naujų skelbimų nebuvo, seen.json
-    # vis tiek pasikeis ir workflow padarys commit'ą. Tai svarbu, nes GitHub
-    # automatiškai IŠJUNGIA scheduled (cron) workflow'us, jei repo'jė
-    # neatsiranda jokios "activity" (commit/push) 60 dienų iš eilės. Kadangi
-    # čia paieškos labai nišinės, gali lengvai praeiti 2+ mėn. be naujo
-    # skelbimo - be šio "heartbeat" tai reikštų, kad automatinis tikrinimas
-    # tyliai išsijungtų ir liktų veikti tik rankinis paleidimas.
-    seen["_meta"] = {"last_checked_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
     save_seen(seen)
 
