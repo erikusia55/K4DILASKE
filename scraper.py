@@ -101,6 +101,7 @@ MONITORS = [
 ]
 
 SEEN_FILE = "seen.json"
+SEEN_LIMIT = 500  # kiek daugiausia ID laikom kiekvienai platformai
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -151,6 +152,7 @@ def get_exchange_rate(from_currency, to_currency="EUR"):
     _EXCHANGE_RATE_CACHE[key] = rate
     return rate
 
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -186,16 +188,22 @@ def send_telegram(text):
         print(text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=15,
-    )
+    # try/except būtinas: jei užklausa baigtųsi timeout'u, skriptas nenulūžta,
+    # seen.json vis tiek išsaugomas ir kitas paleidimas nesiunčia dublikatų.
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"[!] Telegram klaida: {e}")
+        return
     if not resp.ok:
         print(f"[!] Telegram klaida: {resp.status_code} {resp.text}")
 
@@ -207,12 +215,6 @@ def parse_otomoto_articles(html, base_url):
     dėl reklaminių/pažymėtų skelbimų)."""
     article_re = re.compile(r'<article[^>]*data-id="(\d+)"[^>]*>(.*?)</article>', re.DOTALL)
     href_re = re.compile(r'href="(https://www\.otomoto\.pl/[^"]+?\.html)"')
-    # lankstus kainos gaudymas: ieškom skaičiaus <span translate="no"> viduje,
-    # o valiutos - bet kur netoliese po jo (tarp jų gali būti įvairūs tegai)
-    price_re = re.compile(
-        r'<span[^>]*translate="no"[^>]*>\s*([\d\s\u00a0]+)\s*</span>(.{0,200}?)(PLN|EUR|z\u0142)',
-        re.DOTALL,
-    )
     title_re = re.compile(r'aria-label="([^"]+)"')
 
     listings = {}
@@ -302,7 +304,7 @@ def parse_otomoto_articles(html, base_url):
 
 
 def fetch_listings(monitor):
-    """Grąžina dict {unikalus_id: pilnas_url} rastą puslapyje."""
+    """Grąžina dict {unikalus_id: {...}} rastą puslapyje, arba None klaidos atveju."""
     try:
         session = requests.Session()
         session.headers.update(HEADERS)
@@ -369,60 +371,70 @@ def fetch_listings(monitor):
     return listings
 
 
+def format_message(name, item):
+    parts = []
+    if item["brand"]:
+        parts.append(f"<b>{item['brand']}</b>")
+    if item["price"]:
+        price_text = f"{item['price']} {item['currency']}".strip()
+        # jei kaina PLN, papildomai parodom konvertuotą EUR reikšmę
+        if item["currency"] == "PLN":
+            try:
+                price_num = float(str(item["price"]).replace(" ", "").replace(",", "."))
+                rate = get_exchange_rate("PLN", "EUR")
+                eur_value = round(price_num * rate)
+                price_text = f"~{eur_value} € ({item['price']} PLN)"
+            except (ValueError, TypeError):
+                pass
+        parts.append(price_text)
+    summary = " · ".join(parts) if parts else "Naujas skelbimas"
+    return f"🚗 {summary} ({name})\n{item['url']}"
+
+
 def main():
     seen = load_seen()
     any_new = False
 
-    for monitor in MONITORS:
-        name = monitor["name"]
-        print(f"Tikrinu: {name} ...")
-        listings = fetch_listings(monitor)
+    # try/finally: seen.json išsaugomas net jei kažkur vidury įvyktų netikėta
+    # klaida - kitaip kitas paleidimas vėl siųstų jau išsiųstus skelbimus.
+    try:
+        for monitor in MONITORS:
+            name = monitor["name"]
+            print(f"Tikrinu: {name} ...")
+            listings = fetch_listings(monitor)
 
-        if listings is None:
-            continue  # klaida gaunant puslapį, praleidžiam šį ratą
+            if listings is None:
+                continue  # klaida gaunant puslapį, praleidžiam šį ratą
 
-        if len(listings) == 0:
-            print(f"[!] {name}: rasta 0 skelbimų - greičiausiai reikia pakoreguoti link_pattern regex.")
+            if len(listings) == 0:
+                print(f"[!] {name}: rasta 0 skelbimų - greičiausiai reikia pakoreguoti link_pattern regex.")
 
-        platform_seen = set(seen.get(name, []))
+            if name not in seen:
+                # Pirmas paleidimas šiai platformai - tik išsaugom esamus skelbimus,
+                # nesiunčiam alertų už "senus" skelbimus.
+                seen[name] = list(listings.keys())[-SEEN_LIMIT:]
+                print(f"[i] {name}: pirmas paleidimas, išsaugota {len(listings)} skelbimų kaip bazinė būsena.")
+                continue
 
-        if name not in seen:
-            # Pirmas paleidimas šiai platformai - tik išsaugom esamus skelbimus,
-            # nesiunčiam alertų už "senus" skelbimus.
-            seen[name] = list(listings.keys())
-            print(f"[i] {name}: pirmas paleidimas, išsaugota {len(listings)} skelbimų kaip bazinė būsena.")
-            continue
+            old_list = seen.get(name, [])
+            platform_seen = set(old_list)
+            new_ids = [uid for uid in listings if uid not in platform_seen]
 
-        new_ids = [uid for uid in listings if uid not in platform_seen]
+            for uid in new_ids:
+                any_new = True
+                item = listings[uid]
+                send_telegram(format_message(name, item))
+                print(f"[+] Naujas skelbimas: {item['url']}")
 
-        for uid in new_ids:
-            any_new = True
-            item = listings[uid]
-            parts = []
-            if item["brand"]:
-                parts.append(f"<b>{item['brand']}</b>")
-            if item["price"]:
-                price_text = f"{item['price']} {item['currency']}".strip()
-                # jei kaina PLN, papildomai parodom konvertuotą EUR reikšmę
-                if item["currency"] == "PLN":
-                    try:
-                        price_num = float(str(item["price"]).replace(" ", "").replace(",", "."))
-                        rate = get_exchange_rate("PLN", "EUR")
-                        eur_value = round(price_num * rate)
-                        price_text = f"~{eur_value} € ({item['price']} PLN)"
-                    except (ValueError, TypeError):
-                        pass
-                parts.append(price_text)
-            summary = " · ".join(parts) if parts else "Naujas skelbimas"
-            msg = f"🚗 {summary} ({name})\n{item['url']}"
-            send_telegram(msg)
-            print(f"[+] Naujas skelbimas: {item['url']}")
-
-        # atnaujinam seen sąrašą (laikom tik paskutinius ~500, kad failas neaugtų amžinai)
-        updated = list(platform_seen.union(listings.keys()))
-        seen[name] = updated[-500:]
-
-    save_seen(seen)
+            # Atnaujinam seen sąrašą išlaikant tvarką: seniausi pradžioje,
+            # šiuo metu puslapyje matomi - gale. Apkarpant iki SEEN_LIMIT
+            # nukenčia tik seniausi ID, o ne atsitiktiniai (kaip būtų su set).
+            current_ids = list(listings.keys())
+            current_set = set(current_ids)
+            updated = [u for u in old_list if u not in current_set] + current_ids
+            seen[name] = updated[-SEEN_LIMIT:]
+    finally:
+        save_seen(seen)
 
     if not any_new:
         print("Naujų skelbimų nerasta.")
