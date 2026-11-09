@@ -2,7 +2,7 @@ name: Automobiliu skelbimu monitoringas
 
 on:
   schedule:
-    # Kas ~20 minučių, bet "nepopuliariomis" minutėmis (7, 27, 47), nes GitHub
+    # Kas ~20 minučių, net "nepopuliariomis" minutėmis (7, 27, 47), nes GitHub
     # daug dažniau praleidžia paleidimus apvaliomis minutėmis. Laikas - UTC.
     - cron: "7,27,47 * * * *"
   workflow_dispatch: {}  # leidžia paleisti rankiniu būdu iš Actions skirtuko
